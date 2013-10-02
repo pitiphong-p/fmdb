@@ -8,7 +8,7 @@
 
 void testPool(NSString *dbPath);
 void testDateFormat();
-void testConcurrentQueue();
+void testConcurrentQueue(NSString *path);
 void FMDBReportABugFunction();
 
 int main (int argc, const char * argv[]) {
@@ -1050,8 +1050,10 @@ int main (int argc, const char * argv[]) {
         
         
     }];
-    
-    testConcurrentQueue();
+  
+    NSString *concurrentDBPath = @"/tmp/concurrenttmp.db";
+  testConcurrentQueue(concurrentDBPath);
+    testConcurrentQueue(nil);
     
     NSLog(@"That was version %@ of sqlite", [FMDatabase sqliteLibVersion]);
     
@@ -1404,8 +1406,15 @@ void testDateFormat() {
     [db close];
 }
 
-void testConcurrentQueue() {
-    FMDatabaseQueue *queue = [FMDatabaseQueue databaseQueueWithPath:nil];
+void testConcurrentQueue(NSString *path) {
+  if (path) {
+    // delete the old db.
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    [fileManager removeItemAtPath:path error:nil];
+    
+  }
+  
+    FMDatabaseQueue *queue = [FMDatabaseQueue databaseQueueWithPath:path];
     
     FMDBQuickCheck(queue);
     

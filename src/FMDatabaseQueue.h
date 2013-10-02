@@ -58,9 +58,10 @@
  @warning Do not instantiate a single `<FMDatabase>` object and use it across multiple threads. Use `FMDatabaseQueue` instead.
  
  @warning The calls to `FMDatabaseQueue`'s default methods are blocking.  So even though you are passing along blocks, they will **not** be run on another thread.  By the way, we provide the asynchronous methods too.
- @warning We are not provide nested calling support. If you perform writer operation/transaction inside the reader one, that operation/transaction will be performed as reader operation/transaction but it won't be dead lock. Please be careful for this case.
+ @warning We are not provide fully nested calling support. If you perform writer operation/transaction inside the reader one, that operation/transaction will be performed as reader operation/transaction but it won't be dead lock. Please be careful for this case.
 
  */
+
 
 typedef void(^FMDatabaseOperationBlock)(FMDatabase *db);
 typedef void(^FMDatabaseTransactionBlock)(FMDatabase *db, BOOL *rollback);
@@ -71,10 +72,11 @@ typedef void(^FMDatabaseCompletionBlock)(BOOL success, NSError *error);
     NSString            *_path;
     dispatch_queue_t    _queue;
     FMDatabase          *_db;
+    NSMutableSet        *_databases;
+    NSLock              *_lock;
 }
 
 @property (atomic, retain) NSString *path;
-@property (nonatomic, readonly, strong) FMDatabase *database;
 
 ///----------------------------------------------------
 /// @name Initialization, opening, and closing of queue

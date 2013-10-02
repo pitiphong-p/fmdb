@@ -18,6 +18,33 @@
  */
 
 static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
+NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatabase";
+
+
+@interface FMDatabaseQueue ()
+
+
+/**
+ Default database is used in case we cannot deperated databases per thread. 
+ eg. The queue run database on memory.
+ */
+@property (readonly) FMDatabase *defaultDatabase;
+
+/**
+ Get the appropritate database for running the block in the current thread.
+ @return database for running the block in the current thread.
+ */
+- (FMDatabase *)databaseForCurrentThread;
+
+/**
+ Clear the database before leaving thread.
+ @param database Database that is being clear.
+ */
+- (void)clearDatbase:(FMDatabase *)database;
+
+
+@end
+
 
 @implementation FMDatabaseQueue
 
@@ -38,17 +65,16 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
     
     if (self != nil) {
         
-        _db = [FMDatabase databaseWithPath:aPath];
-        _db.allowsMultiThread = YES;
-        FMDBRetain(_db);
-        
-        if (![_db openWithFlags:(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)]) {
+        if (!self.defaultDatabase) {
             NSLog(@"Could not create database queue for path %@", aPath);
             FMDBRelease(self);
             return 0x00;
         }
         
+        _lock = [[NSLock alloc] init];
         _path = FMDBReturnRetained(aPath);
+        
+        _databases = [[NSMutableSet alloc] init];
         
         _queue = dispatch_queue_create([[NSString stringWithFormat:@"fmdb.%@", self] UTF8String], DISPATCH_QUEUE_CONCURRENT);
         dispatch_queue_set_specific(_queue, FMDatabaseQueueGCDKey, (__bridge void *)self, NULL);
@@ -59,6 +85,8 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
 
 - (void)dealloc {
     
+    FMDBRelease(_databases);
+    FMDBRelease(_lock);
     FMDBRelease(_db);
     FMDBRelease(_path);
     
@@ -77,6 +105,11 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
         [_db close];
         FMDBRelease(_db);
         _db = 0x00;
+        
+        NSSet *databases = [_databases copy];
+        for (FMDatabase *database in databases) {
+            [self clearDatbase:database];
+        }
     };
 
     if (dispatch_get_specific(FMDatabaseQueueGCDKey) == (__bridge void *)(self)) {
@@ -89,18 +122,7 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
 }
 
 - (FMDatabase*)database {
-    if (!_db) {
-        _db = FMDBReturnRetained([FMDatabase databaseWithPath:_path]);
-        
-        if (![_db openWithFlags:(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)]) {
-            NSLog(@"FMDatabaseQueue could not reopen database for path %@", _path);
-            FMDBRelease(_db);
-            _db  = 0x00;
-            return 0x00;
-        }
-    }
-    
-    return _db;
+    return [self defaultDatabase];
 }
 
 
@@ -138,16 +160,22 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
                                 isWriterOperation:(BOOL)isWritter
                                         operation:(FMDatabaseOperationBlock)block {
     FMDBRetain(self);
-    
+  
     dispatch_block_t work = ^{
-        
-        FMDatabase *db = [self database];
-        block(db);
+        FMDatabase *database = [self databaseForCurrentThread];
       
-        if (isWritter && [db hasOpenResultSets]) {
+        // If we call perform nested operation synchronously, we test if the thread has the database or not.
+        NSAssert(database,
+                 @"Perform the operation within the nested block without thread database!!!");
+        
+        block(database);
+      
+        if (isWritter && [database hasOpenResultSets]) {
             NSLog(@"Warning: there is at least one open result set around after performing [FMDatabaseQueue inDatabase:]");
         }
-      
+        
+        [self clearDatbase:database];
+        
         FMDBRelease(self);
     };
     
@@ -190,14 +218,13 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
 - (BOOL)performWriterTransactionWithError:(NSError * __autoreleasing *)error
                                usingBlock:(FMDatabaseTransactionBlock)block {
     return [self performDatabaseTransactionWithDeffered:NO
-                                      isWriterOperation:YES
                                                   error:error
                                              usingBlock:block];
 }
 
-- (BOOL)performWriterDeferredTransactionWithError:(NSError * __autoreleasing *)error usingBlock:(FMDatabaseTransactionBlock)block {
+- (BOOL)performWriterDeferredTransactionWithError:(NSError * __autoreleasing *)error
+                                       usingBlock:(FMDatabaseTransactionBlock)block {
     return [self performDatabaseTransactionWithDeffered:YES
-                                      isWriterOperation:YES
                                                   error:error
                                              usingBlock:block];
 }
@@ -206,62 +233,62 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
     [self performAsynchronouslyWriterDeferredTransaction:block completion:NULL];
 }
 
-- (void)performAsynchronouslyWriterTransaction:(FMDatabaseTransactionBlock)block completion:(FMDatabaseCompletionBlock)completion {
+- (void)performAsynchronouslyWriterTransaction:(FMDatabaseTransactionBlock)block
+                                    completion:(FMDatabaseCompletionBlock)completion {
     [self performDatabaseTransactionAsynchronouslyWithDeffered:NO
-                                             isWriterOperation:YES
                                                    transaction:block
                                                     completion:completion];
 }
 
-- (void)performAsynchronouslyWriterDeferredTransaction:(FMDatabaseTransactionBlock)block completion:(FMDatabaseCompletionBlock)completion {
+- (void)performAsynchronouslyWriterDeferredTransaction:(FMDatabaseTransactionBlock)block
+                                            completion:(FMDatabaseCompletionBlock)completion {
     [self performDatabaseTransactionAsynchronouslyWithDeffered:YES
-                                             isWriterOperation:YES
                                                    transaction:block
                                                     completion:completion];
 }
 
 - (BOOL)performDatabaseTransactionWithDeffered:(BOOL)useDeferred
-                             isWriterOperation:(BOOL)isWritter
                                          error:(NSError * __autoreleasing *)error
                                     usingBlock:(FMDatabaseTransactionBlock)block {
     __block BOOL success = NO;
     FMDBRetain(self);
     dispatch_block_t work = ^{
         
+        FMDatabase *database = [self databaseForCurrentThread];
+        
         BOOL shouldRollback = NO;
         
         if (useDeferred) {
-            success = [[self database] beginDeferredTransaction];
+            success = [database beginDeferredTransaction];
         }
         else {
-            success = [[self database] beginTransaction];
+            success = [database beginTransaction];
         }
         
         if (success) {
-            block([self database], &shouldRollback);
+            block(database, &shouldRollback);
             
             if (shouldRollback) {
-                success = [[self database] rollback];
+                success = [database rollback];
             }
             else {
-                success = [[self database] commit];
+                success = [database commit];
             }
         }
         
         if (!success && error) {
-            *error = [[self database] lastError];
+            *error = [database lastError];
         }
+        
+        [self clearDatbase:database];
     };
     
     
     if (dispatch_get_specific(FMDatabaseQueueGCDKey) == (__bridge void *)(self)) {
         work();
     }
-    else if (isWritter) {
-        dispatch_barrier_sync(_queue, work);
-    }
     else {
-        dispatch_sync(_queue, work);
+        dispatch_barrier_sync(_queue, work);
     }
     
     FMDBRelease(self);
@@ -270,7 +297,6 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
 }
 
 - (void)performDatabaseTransactionAsynchronouslyWithDeffered:(BOOL)useDeferred
-                                           isWriterOperation:(BOOL)isWriter
                                                  transaction:(FMDatabaseTransactionBlock)block
                                                   completion:(FMDatabaseCompletionBlock)completion {
     __block BOOL success = NO;
@@ -278,34 +304,36 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
     FMDBRetain(self);
     dispatch_block_t work = ^{
         
+        FMDatabase *database = [self databaseForCurrentThread];
         BOOL shouldRollback = NO;
         
         if (useDeferred) {
-            success = [[self database] beginDeferredTransaction];
+            success = [database beginDeferredTransaction];
         }
         else {
-            success = [[self database] beginTransaction];
+            success = [database beginTransaction];
         }
         
         if (success) {
-            block([self database], &shouldRollback);
+            block(database, &shouldRollback);
             
             if (shouldRollback) {
-                success = [[self database] rollback];
+                success = [database rollback];
             }
             else {
-                success = [[self database] commit];
+                success = [database commit];
             }
         }
         
         if (!success) {
-            error = [[self database] lastError];
+            error = [database lastError];
         }
         
         if (completion) {
             completion(success, error);
         }
-      
+        
+        [self clearDatbase:database];
         FMDBRelease(self);
     };
     
@@ -313,11 +341,8 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
     if (dispatch_get_specific(FMDatabaseQueueGCDKey) == (__bridge void *)(self)) {
         work();
     }
-    else if (isWriter) {
-        dispatch_barrier_async(_queue, work);
-    }
     else {
-        dispatch_async(_queue, work);
+        dispatch_barrier_async(_queue, work);
     }
 }
 
@@ -329,19 +354,20 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
     FMDBRetain(self);
     dispatch_block_t work = ^{
         
+        FMDatabase *database = [self defaultDatabase];
         NSString *name = [NSString stringWithFormat:@"savePoint%ld", savePointIdx++];
         
         BOOL shouldRollback = NO;
         
-        if ([[self database] startSavePointWithName:name error:&err]) {
+        if ([database startSavePointWithName:name error:&err]) {
             
-            block([self database], &shouldRollback);
+            block(database, &shouldRollback);
             
             if (shouldRollback) {
-                [[self database] rollbackToSavePointWithName:name error:&err];
+                [database rollbackToSavePointWithName:name error:&err];
             }
             else {
-                [[self database] releaseSavePointWithName:name error:&err];
+                [database releaseSavePointWithName:name error:&err];
             }
             
         }
@@ -358,4 +384,62 @@ static const void * const FMDatabaseQueueGCDKey = &FMDatabaseQueueGCDKey;
 }
 #endif
 
+
+#pragma mark - Private methods
+
+- (FMDatabase *)databaseForCurrentThread {
+    FMDatabase *database = nil;
+    if (self.path) {
+        [_lock lock];
+        database = [[[NSThread currentThread] threadDictionary] objectForKey:FMDatabaseQueueThreadDatabaseKey];
+        if (!database) {
+            database = FMDBReturnAutoreleased([FMDatabase databaseWithPath:self.path]);
+            database.allowsMultiThread = YES;
+            [[[NSThread currentThread] threadDictionary] setObject:database
+                                                            forKey:FMDatabaseQueueThreadDatabaseKey];
+        }
+        
+        if (![database open]) {
+            NSLog(@"Could not create database queue for path %@", self.path);
+        }
+        
+        if (database) {
+            [_databases addObject:database];
+        }
+        [_lock unlock];
+    } else {
+        database = self.defaultDatabase;
+    }
+    
+    return database;
+}
+
+- (void)clearDatbase:(FMDatabase *)database {
+    [_lock lock];
+    if ([_databases containsObject:database]) {
+        [database close];
+        
+        [[[NSThread currentThread] threadDictionary] removeObjectForKey:FMDatabaseQueueThreadDatabaseKey];
+        [_databases removeObject:database];
+    }
+    [_lock unlock];
+}
+
+- (FMDatabase *)defaultDatabase {
+    if (!_db) {
+        _db = [FMDatabase databaseWithPath:self.path];
+        _db
+        .allowsMultiThread = YES;
+        if ([_db openWithFlags:(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)]) {
+            FMDBRetain(_db);
+        } else {
+            _db = nil;
+        }
+    }
+    
+    return _db;
+}
+
+
 @end
+
