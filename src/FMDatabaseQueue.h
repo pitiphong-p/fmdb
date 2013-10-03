@@ -72,11 +72,15 @@ typedef void(^FMDatabaseCompletionBlock)(BOOL success, NSError *error);
     NSString            *_path;
     dispatch_queue_t    _queue;
     FMDatabase          *_db;
-    NSMutableSet        *_databases;
+    NSCountedSet        *_databases;
     NSLock              *_lock;
 }
 
 @property (atomic, retain) NSString *path;
+
+/** Busy retry timeout */
+
+@property (nonatomic, assign) int busyRetryTimeout;
 
 ///----------------------------------------------------
 /// @name Initialization, opening, and closing of queue

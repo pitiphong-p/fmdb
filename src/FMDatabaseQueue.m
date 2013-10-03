@@ -42,13 +42,25 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
  */
 - (void)clearDatbase:(FMDatabase *)database;
 
-
 @end
 
 
 @implementation FMDatabaseQueue
 
 @synthesize path = _path;
+
+- (void)setBusyRetryTimeout:(int)busyRetryTimeout {
+  if (self->_busyRetryTimeout != busyRetryTimeout) {
+    self->_busyRetryTimeout = busyRetryTimeout;
+    
+    _db.busyRetryTimeout = self.busyRetryTimeout;
+    [_lock lock];
+    for (FMDatabase *database in _databases) {
+      database.busyRetryTimeout = self.busyRetryTimeout;
+    }
+    [_lock unlock];
+  }
+}
 
 + (instancetype)databaseQueueWithPath:(NSString*)aPath {
     
@@ -74,7 +86,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         _lock = [[NSLock alloc] init];
         _path = FMDBReturnRetained(aPath);
         
-        _databases = [[NSMutableSet alloc] init];
+        _databases = [[NSCountedSet alloc] init];
         
         _queue = dispatch_queue_create([[NSString stringWithFormat:@"fmdb.%@", self] UTF8String], DISPATCH_QUEUE_CONCURRENT);
         dispatch_queue_set_specific(_queue, FMDatabaseQueueGCDKey, (__bridge void *)self, NULL);
@@ -110,6 +122,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         for (FMDatabase *database in databases) {
             [self clearDatbase:database];
         }
+        FMDBRelease(databases);
     };
 
     if (dispatch_get_specific(FMDatabaseQueueGCDKey) == (__bridge void *)(self)) {
@@ -119,10 +132,6 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         dispatch_barrier_sync(_queue, work);
     }
     FMDBRelease(self);
-}
-
-- (FMDatabase*)database {
-    return [self defaultDatabase];
 }
 
 
@@ -393,8 +402,9 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         [_lock lock];
         database = [[[NSThread currentThread] threadDictionary] objectForKey:FMDatabaseQueueThreadDatabaseKey];
         if (!database) {
-            database = FMDBReturnAutoreleased([FMDatabase databaseWithPath:self.path]);
+            database = [FMDatabase databaseWithPath:self.path];
             database.allowsMultiThread = YES;
+            database.busyRetryTimeout = self.busyRetryTimeout;
             [[[NSThread currentThread] threadDictionary] setObject:database
                                                             forKey:FMDatabaseQueueThreadDatabaseKey];
         }
@@ -417,10 +427,13 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
 - (void)clearDatbase:(FMDatabase *)database {
     [_lock lock];
     if ([_databases containsObject:database]) {
-        [database close];
-        
-        [[[NSThread currentThread] threadDictionary] removeObjectForKey:FMDatabaseQueueThreadDatabaseKey];
         [_databases removeObject:database];
+        
+        if (![_databases countForObject:database]) {
+            [database close];
+        
+            [[[NSThread currentThread] threadDictionary] removeObjectForKey:FMDatabaseQueueThreadDatabaseKey];
+        }
     }
     [_lock unlock];
 }
@@ -428,8 +441,8 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
 - (FMDatabase *)defaultDatabase {
     if (!_db) {
         _db = [FMDatabase databaseWithPath:self.path];
-        _db
-        .allowsMultiThread = YES;
+        _db.allowsMultiThread = YES;
+        _db.busyRetryTimeout = self.busyRetryTimeout;
         if ([_db openWithFlags:(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)]) {
             FMDBRetain(_db);
         } else {
