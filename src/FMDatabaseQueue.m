@@ -398,9 +398,11 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
 }
 
 - (void)clearDatbase:(FMDatabase *)database {
-  if (database != _db) {
-    [database close];
-  }
+    if (database != _db) {
+        dispatch_async(self->_queue, ^{
+            [database close];
+        });
+    }
 }
 
 - (FMDatabase *)defaultDatabase {
