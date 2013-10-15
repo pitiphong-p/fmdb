@@ -40,7 +40,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
  Clear the database before leaving thread.
  @param database Database that is being clear.
  */
-- (void)clearDatbase:(FMDatabase *)database;
+- (void)poolDatbase:(FMDatabase *)database;
 
 @end
 
@@ -82,6 +82,9 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         
         _queue = dispatch_queue_create([[NSString stringWithFormat:@"fmdb.%@", self] UTF8String], DISPATCH_QUEUE_CONCURRENT);
         dispatch_queue_set_specific(_queue, FMDatabaseQueueGCDKey, (__bridge void *)self, NULL);
+        _poolQueue = dispatch_queue_create([[NSString stringWithFormat:@"fmdb.%@.PoolQueue", self] UTF8String], DISPATCH_QUEUE_SERIAL);
+        
+        _databases = [[NSMutableSet alloc] init];
     }
     
     return self;
@@ -92,10 +95,18 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
     FMDBRelease(_db);
     FMDBRelease(_path);
     
+    FMDBRelease(_databases);
+    
     if (_queue) {
         FMDBDispatchQueueRelease(_queue);
         _queue = 0x00;
     }
+    
+    if (_poolQueue) {
+        FMDBDispatchQueueRelease(_poolQueue);
+        _poolQueue = 0x00;
+    }
+    
 #if ! __has_feature(objc_arc)
     [super dealloc];
 #endif
@@ -108,6 +119,15 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
         FMDBRelease(_db);
         _db = 0x00;
     };
+    
+    dispatch_sync(_poolQueue, ^{
+        NSSet *databases = [_databases copy];
+        for (FMDatabase *database in databases) {
+            [database close];
+        }
+        
+        [_databases removeAllObjects];
+    });
 
     if (dispatch_get_specific(FMDatabaseQueueGCDKey) == (__bridge void *)(self)) {
         work();
@@ -167,7 +187,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
             NSLog(@"Warning: there is at least one open result set around after performing [FMDatabaseQueue inDatabase:]");
         }
         
-        [self clearDatbase:database];
+        [self poolDatbase:database];
         
         FMDBRelease(self);
     };
@@ -273,7 +293,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
             *error = [database lastError];
         }
         
-        [self clearDatbase:database];
+        [self poolDatbase:database];
     };
     
     
@@ -326,7 +346,7 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
             completion(success, error);
         }
         
-        [self clearDatbase:database];
+        [self poolDatbase:database];
         FMDBRelease(self);
     };
     
@@ -381,26 +401,34 @@ NSString * const FMDatabaseQueueThreadDatabaseKey = @"FMDatabaseQueueThreadDatab
 #pragma mark - Private methods
 
 - (FMDatabase *)databaseForCurrentThread {
-    FMDatabase *database = nil;
+    __block FMDatabase *database = nil;
     if (self.path) {
-      database = [FMDatabase databaseWithPath:self.path];
-      database.allowsMultiThread = YES;
-      database.busyRetryTimeout = self.busyRetryTimeout;
-      
-      if (![database open]) {
-        NSLog(@"Could not create database queue for path %@", self.path);
-      }
+        dispatch_sync(_poolQueue, ^{
+            database = [_databases anyObject];
+            if (!database) {
+                database = [FMDatabase databaseWithPath:self.path];
+                database.busyRetryTimeout = self.busyRetryTimeout;
+                
+                if (![database open]) {
+                    NSLog(@"Could not create database queue for path %@", self.path);
+                }
+            } else {
+              [_databases removeObject:database];
+            }
+            FMDBRetain(database);
+        });
     } else {
         database = self.defaultDatabase;
+        FMDBRetain(database);
     }
     
-    return database;
+    return FMDBReturnAutoreleased(database);
 }
 
-- (void)clearDatbase:(FMDatabase *)database {
+- (void)poolDatbase:(FMDatabase *)database {
     if (database != _db) {
-        dispatch_async(self->_queue, ^{
-            [database close];
+        dispatch_sync(_poolQueue, ^{
+            [_databases addObject:database];
         });
     }
 }

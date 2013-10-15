@@ -72,6 +72,8 @@ typedef void(^FMDatabaseCompletionBlock)(BOOL success, NSError *error);
     NSString            *_path;
     dispatch_queue_t    _queue;
     FMDatabase          *_db;
+    dispatch_queue_t    _poolQueue;
+    NSMutableSet        *_databases;
 }
 
 @property (atomic, retain) NSString *path;
